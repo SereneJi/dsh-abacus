@@ -17,8 +17,16 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { zstdCompressSync } from 'node:zlib'
 
-const { LOG_NAME, eventsOfText, framesToText, readSessionLog, sessionIdOf, sessionLogPaths } =
-  await import('../lib/host/history.js')
+const {
+  LOG_NAME,
+  eventsOfText,
+  framesToText,
+  readSessionLog,
+  sessionIdOf,
+  sessionLogPaths,
+  settlementKeys,
+  withoutReplays,
+} = await import('../lib/host/history.js')
 
 /** One zstd frame per line, the way DSH appends them. */
 function frames(...lines) {
@@ -97,4 +105,75 @@ test('readSessionLog reports an unreadable file instead of throwing', async () =
   const log = await readSessionLog(join(workdir(), 'gone', LOG_NAME))
   assert.deepEqual(log.events, [])
   assert.equal(typeof log.sessionId, 'string')
+})
+
+/** One settlement event, the shape the fold keys its replay guard on. */
+function settlement(seq, time, turn, step) {
+  return {
+    type: 'assistant/message',
+    seq,
+    time,
+    data: {
+      turn,
+      step,
+      usage: { inputTokens: 10, outputTokens: 2 },
+      message: { source: { provider: 'opencode-go', model: 'deepseek-v4.1-flash' } },
+    },
+  }
+}
+
+test('settlementKeys names a settlement by when it happened and what served it', () => {
+  const keys = settlementKeys([
+    settlement(1, 1000, 1, 1),
+    settlement(2, 2000, 1, 2),
+    // Not a settlement: a request header carries no usage.
+    { type: 'request/header', seq: 3, time: 3000, data: {} },
+    // A settlement with no usage cannot be compared, so it is not a key either.
+    { type: 'assistant/message', seq: 4, time: 4000, data: { turn: 2, step: 1 } },
+  ])
+  assert.equal(keys.size, 2)
+  // Two calls at the same step of different turns are two different calls, which
+  // is why the turn and step are part of the identity and not just the clock.
+  assert.notEqual([...keys][0], [...keys][1])
+  // The same settlement read twice is the same key, which is what makes a copy
+  // of a log recognisable.
+  assert.deepEqual([...settlementKeys([settlement(9, 1000, 1, 1)])], [...keys].slice(0, 1))
+})
+
+test('withoutReplays drops a log whose settlements are all in a bigger log', () => {
+  const parent = {
+    sessionId: 'session-parent',
+    events: [settlement(1, 1000, 1, 1), settlement(2, 2000, 1, 2), settlement(3, 3000, 2, 1)],
+  }
+  // A side conversation copies the parent's log and then writes its own header.
+  // Its settlements are a subset, and folding it would count the parent twice.
+  const copy = { sessionId: 'session-copy', events: [settlement(1, 1000, 1, 1), settlement(2, 2000, 1, 2)] }
+  const other = { sessionId: 'session-other', events: [settlement(1, 500, 1, 1)] }
+
+  const { kept, replays } = withoutReplays([parent, copy, other])
+  assert.deepEqual(
+    kept.map((log) => log.sessionId),
+    ['session-parent', 'session-other'],
+  )
+  assert.deepEqual(
+    replays.map((log) => log.sessionId),
+    ['session-copy'],
+  )
+})
+
+test('withoutReplays keeps a pair it cannot tell apart, and keeps a log with no calls', () => {
+  // Identical settlement sets: guessing which one wrote first would throw away a
+  // real session, so neither is dropped. The duplicate is the lesser evil.
+  const one = { sessionId: 'session-a', events: [settlement(1, 1000, 1, 1)] }
+  const two = { sessionId: 'session-b', events: [settlement(1, 1000, 1, 1)] }
+  // A log with no settlements is not covered by anything: `[]` is a subset of
+  // everything, so a careless containment test would drop every empty log.
+  const empty = { sessionId: 'session-empty', events: [{ type: 'session', id: 'session-empty' }] }
+
+  const { kept, replays } = withoutReplays([one, two, empty])
+  assert.deepEqual(
+    kept.map((log) => log.sessionId),
+    ['session-a', 'session-b', 'session-empty'],
+  )
+  assert.deepEqual(replays, [])
 })

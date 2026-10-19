@@ -21,6 +21,7 @@ import { zstdCompressSync } from 'node:zlib'
 
 const { UsageService } = await import('../lib/host/usage-service.js')
 const { makeRoutes } = await import('../lib/host/routes.js')
+const { localDateKey } = await import('../lib/core/document.js')
 
 /**
  * A minimal host context: records the `session/event` listener and the
@@ -104,12 +105,32 @@ async function answer(routes, request, response) {
   return response
 }
 
+/**
+ * A local timestamp at `hour` o'clock, `dayOffset` days before today.
+ *
+ * The live fold's fixtures used to hardcode `2026-10-18`, which made this suite
+ * pass only on the day it was written: `overview.usage.today` is derived from
+ * the clock, so the next morning every folded call landed on a day the
+ * assertions never asked about and four tests failed with `0 !== 2`. Anything
+ * that asserts against "today" has to be built from today. Tests that need a
+ * fixed date — the range route, the replay guard — pass `time` explicitly.
+ * @param {number} hour - local hour of day.
+ * @param {number} [dayOffset] - days before today.
+ * @returns {number} epoch milliseconds.
+ */
+function localTime(hour, dayOffset = 0) {
+  const date = new Date()
+  date.setDate(date.getDate() - dayOffset)
+  date.setHours(hour, 0, 0, 0)
+  return date.getTime()
+}
+
 /** A settlement event carrying usage. */
 function settlement(overrides = {}) {
   return {
     type: 'assistant/message',
     seq: overrides.seq ?? 1,
-    time: overrides.time ?? new Date('2026-10-18T10:00:00').getTime(),
+    time: overrides.time ?? localTime(10),
     data: {
       turn: overrides.turn ?? 1,
       step: overrides.step ?? 1,
@@ -133,6 +154,11 @@ async function started(config, home, options = {}) {
   const ctx = fakeContext()
   const service = new UsageService(ctx, config, options)
   await service.start()
+  // `start()` fires the log scan without waiting for it, and a settlement that
+  // lands while that scan is walking is held until it ends — otherwise the scan
+  // would skip the log as already counted and the history would be lost. Wait
+  // for the scan that is already running, without starting or consuming one.
+  if (service.backfilling !== undefined) await service.backfilling
   return { ctx, service, home: process.env.DSH_HOME }
 }
 
@@ -163,7 +189,13 @@ function logged(overrides = {}) {
       turn: overrides.turn ?? 1,
       step: overrides.step ?? 1,
       usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110, ...(overrides.usage ?? {}) },
-      message: { source: { kind: 'model', provider: overrides.provider ?? 'opencode-go', model: overrides.model ?? 'deepseek-v4.1-flash' } },
+      message: {
+        source: { kind: 'model', provider: overrides.provider ?? 'opencode-go', model: overrides.model ?? 'deepseek-v4.1-flash' },
+        // Real settlements carry a message id. It is optional here so the tests
+        // that predate it keep exercising the id-less path, which must not be
+        // de-duplicated across logs.
+        ...(overrides.id === undefined ? {} : { id: overrides.id }),
+      },
     },
   }
 }
@@ -183,7 +215,10 @@ test('a fresh service replays the sessions DSH already saved', async () => {
   })
 
   const { service } = await started(undefined, undefined, { sessionsDir: root })
-  const tally = await service.backfill()
+  // `started()` already waited for the first scan, so a plain call answers
+  // "nothing to do"; forcing it is what replays the logs again, and the replay
+  // guard is what keeps that second pass from counting anything twice.
+  const tally = await service.backfill({ force: true })
 
   assert.equal(tally.skipped, false)
   assert.equal(tally.files, 2)
@@ -256,7 +291,10 @@ test('a replay skips events that carry no sequence number', async () => {
   })
 
   const { service } = await started(undefined, undefined, { sessionsDir: root })
-  const tally = await service.backfill()
+  // `started()` already waited for the first scan, so a plain call answers
+  // "nothing to do"; forcing it is what replays the logs again, and the replay
+  // guard is what keeps that second pass from counting anything twice.
+  const tally = await service.backfill({ force: true })
 
   assert.equal(tally.events, 1, 'the unsequenced event is not replayed')
   assert.equal(service.day('2026-10-16').totals.calls, 1)
@@ -623,6 +661,10 @@ test('the provider list keeps live and recorded routes and hides the dormant cat
   })
   const service = new UsageService(ctx)
   await service.start()
+  // The scan `start()` kicks off runs behind the live fold, and an event that
+  // lands while it walks is held until it ends. Wait for it here so the
+  // settlement below is folded straight away instead of queued.
+  await service.backfill()
 
   // Live routes are always listed, and a runtime name that merely repeats the
   // route key is replaced by the fallback table's legible name.
@@ -679,3 +721,336 @@ test('a service built without a reminder provider reports an empty list', async 
   await service.stop()
 })
 
+test('folds each settlement into the hour it happened in', async () => {
+  // The day map is the ledger; the hour map is the same fold at a finer key.
+  // Both come out of one `applySample`, so they cannot disagree.
+  const root = sessionsRoot({})
+  const { ctx, service } = await started(undefined, undefined, { sessionsDir: root })
+  emit(ctx, 's1', settlement({ seq: 1, turn: 1, step: 1, time: localTime(9) }))
+  emit(ctx, 's1', settlement({ seq: 2, turn: 1, step: 2, time: localTime(9) }))
+  emit(ctx, 's1', settlement({ seq: 3, turn: 1, step: 3, time: localTime(14) }))
+
+  const hours = service.hourView(localDateKey(localTime(9)))
+  assert.deepEqual(hours.hours.map((row) => row.hour), [9, 14])
+  assert.equal(hours.hours[0].totals.calls, 2)
+  assert.equal(hours.hours[1].totals.calls, 1)
+  assert.equal(hours.available, true)
+
+  // The invariant the two maps are held to: a day is exactly its hours.
+  const day = service.day(localDateKey(localTime(9))).totals
+  const summed = hours.hours.reduce((acc, row) => acc + row.totals.calls, 0)
+  assert.equal(day.calls, summed)
+  assert.equal(day.inputTokens, hours.hours.reduce((acc, row) => acc + row.totals.inputTokens, 0))
+  await service.stop()
+})
+
+test('a ledger written before hour buckets rebuilds them from the session logs', async () => {
+  // The upgrade path: an existing ledger has days but no hours, and a day
+  // bucket cannot say what time of day a call happened. The logs can.
+  const root = sessionsRoot({
+    'session-old': [
+      logged({ seq: 1, turn: 1, step: 1, time: localTime(8, 1) }),
+      logged({ seq: 2, turn: 1, step: 2, time: localTime(16, 1) }),
+    ],
+  })
+  process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-usage-stat-test-'))
+  const home = process.env.DSH_HOME
+  const stateDir = join(home, 'usage-stat')
+  mkdirSync(stateDir, { recursive: true })
+  const yesterday = localDateKey(localTime(8, 1))
+  // A ledger from the previous version: day buckets, a bookmark, no hours.
+  writeFileSync(join(stateDir, 'usage.json'), JSON.stringify({
+    version: 1,
+    days: { [yesterday]: { 'opencode-go': { 'deepseek-v4.1-flash': { inputTokens: 200, outputTokens: 20, calls: 2 } } } },
+    sessions: { 'session-old': { totals: { inputTokens: 200, outputTokens: 20, calls: 2 }, updatedAt: 1, providers: {}, lastSeq: 2 } },
+    samples: {},
+    history: { atMs: 1, files: 1, events: 2 },
+  }))
+
+  const ctx = fakeContext()
+  const service = new UsageService(ctx, undefined, { sessionsDir: root })
+  await service.start()
+  // `start()` kicks the replay off in the background on purpose; the rebuild is
+  // part of it, so the test waits for the same shared scan.
+  await service.backfill()
+
+  const hours = service.hourView(yesterday)
+  assert.equal(hours.available, true)
+  // The hours come from the events' own timestamps, not from when the rebuild
+  // ran — which is the whole reason the logs are read instead of the day bucket
+  // being smeared over the clock.
+  assert.deepEqual(hours.hours.map((row) => row.hour), [8, 16])
+  assert.equal(hours.hours.reduce((acc, row) => acc + row.totals.calls, 0), 2)
+  // And the rebuild did not touch the day map it was derived from.
+  assert.equal(service.day(yesterday).totals.calls, 2)
+  assert.equal(service.day(yesterday).totals.inputTokens, 200)
+
+  // The rebuild is one-time: the bookmark is written, so a second start does
+  // not walk every log again.
+  await service.stop()
+  const written = JSON.parse(readFileSync(join(stateDir, 'usage.json'), 'utf8'))
+  assert.ok(typeof written.hoursBuiltAt === 'number')
+  assert.equal(written.hours[`${yesterday}T08`]['opencode-go']['deepseek-v4.1-flash'].calls, 1)
+})
+
+test('a single-day range carries the hour breakdown and a longer one does not', async () => {
+  const root = sessionsRoot({})
+  const { ctx, service } = await started(undefined, undefined, { sessionsDir: root })
+  const today = localDateKey(localTime(11))
+  emit(ctx, 's1', settlement({ seq: 1, turn: 1, step: 1, time: localTime(11) }))
+  emit(ctx, 's1', settlement({ seq: 2, turn: 1, step: 2, time: localTime(11, 1) }))
+
+  const oneDay = service.rangeView(today, today)
+  assert.deepEqual(oneDay.hours.hours.map((row) => row.hour), [11])
+  assert.equal(oneDay.hours.date, today)
+
+  // A window that cannot be charted across the clock does not pay for the data.
+  const wider = service.rangeView('', '')
+  assert.equal(wider.hours, undefined)
+  await service.stop()
+})
+
+
+test('the range view converts its tokens to money at the price table', async () => {
+  const { ctx, service } = await started()
+  emit(ctx, 's1', settlement({ seq: 1, turn: 1, step: 1, time: new Date('2026-10-16T10:00:00').getTime() }))
+  emit(ctx, 's1', settlement({ seq: 2, turn: 2, step: 2, time: new Date('2026-10-17T10:00:00').getTime(), model: 'gpt-5.6-luna' }))
+  const routes = makeRoutes(ctx, service)
+  const range = routes.find((route) => route.path.endsWith('/range'))
+
+  const res = fakeResponse()
+  range.handler(loopbackRequest('/api/usage-stat/range?from=&to='), res)
+  assert.equal(res.status, 200)
+  const cost = res.json().range.cost
+
+  // The default fixture bills 100 in, 10 out and 1000 cached read tokens. The
+  // built-in flash row is DeepSeek's off-peak rate (1 / 4 / 0.02 per million),
+  // which is 100 + 40 + 20 per million, and 2026-10-16 is a Friday with the call
+  // at 10:00 — inside DeepSeek's 09:00-12:00 peak window — so the row bills it at
+  // twice that: 320 per million. Written as the expression rather than the literal
+  // so the test does not depend on how a decimal rounds through binary floating
+  // point.
+  assert.equal(cost.currency, 'CNY')
+  assert.equal(cost.total, 320 / 1_000_000)
+  assert.equal(cost.tokens, 2220)
+  assert.equal(cost.pricedTokens, 1110)
+  assert.equal(cost.unpricedTokens, 1110)
+  // luna has no published price, so it is named rather than billed at zero.
+  assert.equal(cost.unpricedCount, 1)
+  assert.deepEqual(cost.unpriced, [{ model: 'gpt-5.6-luna', tokens: 1110 }])
+  const models = cost.providers[0].models
+  assert.deepEqual(models.map((row) => [row.model, row.priced]), [
+    ['deepseek-v4.1-flash', true],
+    ['gpt-5.6-luna', false],
+  ])
+  assert.equal(models[1].cost, 0)
+
+  // Each day carries its own money as well as its own tokens, which is what lets
+  // the cost tab chart a window day by day instead of only converting the total.
+  const days = res.json().range.days
+  assert.deepEqual(days.map((row) => row.date), ['2026-10-16', '2026-10-17'])
+  assert.equal(days[0].cost.total, 320 / 1_000_000)
+  // The unpriced day reports what it could not count rather than billing zero.
+  assert.equal(days[1].cost.total, 0)
+  assert.equal(days[1].cost.unpricedTokens, 1110)
+
+  await service.stop()
+})
+
+test('a single-day range carries the money for each hour', async () => {
+  const { ctx, service } = await started()
+  const day = new Date('2026-10-16T00:00:00')
+  const at = (hour) => {
+    const stamp = new Date(day)
+    stamp.setHours(hour, 0, 0, 0)
+    return stamp.getTime()
+  }
+  emit(ctx, 's1', settlement({ seq: 1, turn: 1, step: 1, time: at(9) }))
+  // 13:00 rather than 15:00 on purpose: 09:00-12:00 and 14:00-18:00 are the peak
+  // windows, so 13:00 is the one hour between them that bills at the off-peak
+  // rate. One peak hour and one off-peak hour is what makes this test say
+  // something about the clock.
+  emit(ctx, 's1', settlement({ seq: 2, turn: 2, step: 2, time: at(13), usage: { inputTokens: 200, outputTokens: 20, cacheReadTokens: 0 } }))
+  const routes = makeRoutes(ctx, service)
+  const range = routes.find((route) => route.path.endsWith('/range'))
+
+  const res = fakeResponse()
+  range.handler(loopbackRequest('/api/usage-stat/range?from=2026-10-16&to=2026-10-16'), res)
+  const hours = res.json().range.hours
+
+  assert.equal(hours.date, '2026-10-16')
+  assert.deepEqual(hours.hours.map((row) => row.hour), [9, 13])
+  assert.equal(hours.hours[0].cost.total, 320 / 1_000_000)
+  assert.equal(hours.hours[1].cost.total, 280 / 1_000_000)
+  // The day's own conversion is the same money the range carries, so the two
+  // numbers on the screen can never disagree.
+  assert.equal(hours.cost.total, res.json().range.cost.total)
+  // And it is exactly its two hours added up, peak hour and off-peak hour alike.
+  assert.equal(hours.cost.total, hours.hours[0].cost.total + hours.hours[1].cost.total)
+
+  await service.stop()
+})
+
+test('correcting a price changes the money reported for calls that already happened', async () => {
+  // This is the whole reason money is a view and not a stored field: a user who
+  // fixes a wrong price expects the fix to apply to the history behind it.
+  const { ctx, service } = await started()
+  emit(ctx, 's1', settlement({ seq: 1, turn: 1, step: 1, time: new Date('2026-10-16T10:00:00').getTime() }))
+  const probes = { configure: () => {}, view: () => ({ updatedAt: 0, probing: false, intervalSec: 300, providers: [], catalog: { probeable: [] } }) }
+  const routes = makeRoutes(ctx, service, probes)
+  const range = routes.find((route) => route.path.endsWith('/range'))
+  const config = routes.find((route) => route.path.endsWith('/config'))
+  const money = () => {
+    const res = fakeResponse()
+    range.handler(loopbackRequest('/api/usage-stat/range?from=&to='), res)
+    return res.json().range.cost.total
+  }
+
+  // Peak-priced: 2026-10-16 is a Friday and the call is at 10:00, inside the
+  // 09:00-12:00 window, so the built-in row bills double the off-peak rate.
+  assert.equal(money(), 320 / 1_000_000)
+
+  const saved = fakeResponse()
+  await config.handler(loopbackRequest('/api/usage-stat/config', 'POST', {
+    prices: { 'deepseek-v4.1-flash': { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } },
+  }), saved)
+  assert.equal(saved.status, 200)
+  assert.deepEqual(saved.json().config.prices, {
+    // `offPeak: false` because this row is the user's: a typed price is a flat
+    // number, so replacing the built-in row also drops its peak rate. Undated, so
+    // it replaces that row from the start rather than adding a later one.
+    'deepseek-v4.1-flash': [{ from: '', input: 1, output: 1, cacheRead: 1, cacheWrite: 1, offPeak: false }],
+  })
+
+  // A different table, different money, with no new call in between: 100 in + 10
+  // out + 1000 cached read at 1 each, and no peak rate on a row the user typed.
+  assert.equal(money(), 1110 / 1_000_000)
+
+  await service.stop()
+})
+
+test('a log that only repeats another session is left out of the fold', async () => {
+  // DSH writes a whole-session copy when a side conversation is opened. Its
+  // settlements are already in the parent's log, and the replay guard is keyed
+  // on the session id, so folding it counts the parent's calls twice — which is
+  // how a ledger ends up reporting tokens nobody spent.
+  const at = localTime(9)
+  const root = sessionsRoot({
+    'session-parent': [
+      logged({ seq: 1, turn: 1, step: 1, time: at }),
+      logged({ seq: 2, turn: 1, step: 2, time: at + 60_000 }),
+    ],
+    'session-copy': [logged({ seq: 1, turn: 1, step: 1, time: at })],
+  })
+  process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-usage-stat-test-'))
+
+  const ctx = fakeContext()
+  const service = new UsageService(ctx, undefined, { sessionsDir: root })
+  await service.start()
+  await service.backfill()
+
+  const totals = service.day(localDateKey(at)).totals
+  assert.equal(totals.calls, 2)
+  assert.equal(totals.inputTokens, 200)
+  await service.stop()
+})
+
+test('a log that repeats a prefix and then adds its own calls is folded once', async () => {
+  // The copy that `withoutReplays` deliberately keeps: its settlements are not a
+  // subset, because it goes on to make a call of its own. Dropping the log would
+  // lose that call; keeping it whole would fold the copied prefix a second time.
+  // So the fold de-duplicates by settlement, not by log, and the replay guard
+  // cannot help here — that guard is keyed on the session id and the copy has its
+  // own.
+  const at = localTime(9)
+  const root = sessionsRoot({
+    'session-parent': [
+      logged({ id: 'm1', seq: 1, turn: 1, step: 1, time: at }),
+      logged({ id: 'm2', seq: 2, turn: 1, step: 2, time: at + 60_000 }),
+    ],
+    'session-child': [
+      // The parent's first call, written down again under the same message id.
+      logged({ id: 'm1', seq: 1, turn: 1, step: 1, time: at }),
+      // ...and one of its own.
+      logged({ id: 'm3', seq: 2, turn: 9, step: 1, time: at + 120_000 }),
+    ],
+  })
+  process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-usage-stat-test-'))
+
+  const ctx = fakeContext()
+  const service = new UsageService(ctx, undefined, { sessionsDir: root })
+  await service.start()
+  await service.backfill()
+
+  // Three settlements were spent; three were recorded.
+  const totals = service.day(localDateKey(at)).totals
+  assert.equal(totals.calls, 3)
+  await service.stop()
+})
+
+test('a ledger that already counted a copied log is rebuilt once', async () => {
+  // The upgrade path. A ledger written before the check existed holds the copies
+  // too, and a day bucket cannot be told which of its calls were copies after the
+  // fact, so the only honest fix is to rebuild it from the logs.
+  const at = localTime(9)
+  const root = sessionsRoot({
+    'session-parent': [
+      logged({ seq: 1, turn: 1, step: 1, time: at }),
+      logged({ seq: 2, turn: 1, step: 2, time: at + 60_000 }),
+    ],
+    'session-copy': [logged({ seq: 1, turn: 1, step: 1, time: at })],
+  })
+  process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-usage-stat-test-'))
+  const home = process.env.DSH_HOME
+  const stateDir = join(home, 'usage-stat')
+  mkdirSync(stateDir, { recursive: true })
+  const day = localDateKey(at)
+  writeFileSync(join(stateDir, 'usage.json'), JSON.stringify({
+    version: 1,
+    days: { [day]: { 'opencode-go': { 'deepseek-v4.1-flash': { inputTokens: 300, outputTokens: 30, calls: 3 } } } },
+    hours: {},
+    sessions: {},
+    samples: {},
+    history: { atMs: 1, files: 2, events: 3 },
+    hoursBuiltAt: 1,
+  }))
+
+  const ctx = fakeContext()
+  const service = new UsageService(ctx, undefined, { sessionsDir: root })
+  await service.start()
+  await service.backfill()
+
+  // Two calls, not three: the copy's repeat of the first one is gone.
+  assert.equal(service.day(day).totals.calls, 2)
+  assert.equal(service.day(day).totals.inputTokens, 200)
+
+  await service.stop()
+  const written = JSON.parse(readFileSync(join(stateDir, 'usage.json'), 'utf8'))
+  // The bookmark is what keeps the rebuild one-time.
+  assert.ok(typeof written.replayGuardAt === 'number')
+  assert.equal(written.sessions['session-copy'], undefined)
+  assert.equal(written.sessions['session-parent'].lastSeq, 2)
+})
+test('a settlement that lands mid-scan is folded after the scan, not into its way', async () => {
+  // The startup order is: subscribe, load the ledger, then walk the logs. A live
+  // settlement can land inside that walk. Folding it immediately would move the
+  // session's replay guard past everything the scan has not reached yet, and the
+  // scan would then skip the whole log as "already counted" — silently losing
+  // every call the live stream never saw, which is the only reason to walk it.
+  const log = [1, 2, 3, 4, 5].map((seq) => settlement({ seq, turn: seq, step: 1 }))
+  const root = sessionsRoot({ 'session-a': log })
+  const { service } = await started(undefined, undefined, { sessionsDir: root })
+
+  const scan = service.backfill({ force: true })
+  // Arrives while the scan is in flight, and numbered past everything in the log.
+  service.onSessionEvent({ id: 'session-a' }, settlement({ seq: 99, turn: 99, step: 1 }))
+  await scan
+
+  const today = localDateKey(Date.now())
+  const totals = service.day(today).totals
+  // Six calls: the five in the log and the live one. Before the fix this was one.
+  assert.equal(totals.calls, 6)
+  assert.equal(totals.inputTokens, 600)
+  // And the guard still holds: the log's copies were not folded twice.
+  assert.equal(service.doc.sessions['session-a'].lastSeq, 99)
+})

@@ -15,12 +15,16 @@ import {
   applySample,
   createDocument,
   deserializeDocument,
+  hasHourBuckets,
+  hoursOfDay,
   isLedgerDateKey,
   ledgerDayKeys,
   localDateKey,
+  mergeBucketMap,
+  mergeTotalsMap,
   pruneDocument,
   SESSION_CAP,
-  summarizeDays,
+  summarizeBuckets,
 } from '../lib/core/document.js'
 import { bucketsOf, isEmptySample, retryBoundaryOf, sampleFromEvent } from '../lib/core/samples.js'
 import { totalTokens } from '../lib/core/totals.js'
@@ -182,13 +186,13 @@ test('prototype-plumbing bucket keys are refused', () => {
   assert.deepEqual(doc.days, {})
 })
 
-test('summarizeDays orders providers and models by weight', () => {
+test('summarizeBuckets orders providers and models by weight', () => {
   const doc = createDocument()
   applySample(doc, sample({ provider: 'a', model: 'small', usage: { inputTokens: 10 } }), undefined)
   applySample(doc, sample({ provider: 'a', model: 'big', usage: { inputTokens: 900 } }), undefined)
   applySample(doc, sample({ provider: 'b', model: 'mid', usage: { inputTokens: 500 } }), undefined)
 
-  const summary = summarizeDays([doc.days[Object.keys(doc.days)[0]]])
+  const summary = summarizeBuckets([doc.days[Object.keys(doc.days)[0]]])
   assert.deepEqual(summary.providers.map((row) => row.provider), ['a', 'b'])
   assert.deepEqual(summary.providers[0].models.map((row) => row.model), ['big', 'small'])
   assert.equal(totalTokens(summary.totals), 1440)
@@ -247,12 +251,20 @@ test('deserializeDocument survives garbage and never pollutes prototypes', () =>
       'not-a-date': { x: { y: { inputTokens: 1 } } },
     },
     sessions: { s1: { totals: { inputTokens: 5, calls: 1 }, updatedAt: 7, lastSeq: 3 } },
-    samples: { s1: { dayKey: '2026-10-18', provider: 'p', model: 'm', usage: { inputTokens: 5, calls: 1 }, turn: 1, step: 2 } },
+    samples: { s1: { atMs: 1_700_000_000_000, dayKey: '2026-10-18', provider: 'p', model: 'm', usage: { inputTokens: 5, calls: 1 }, turn: 1, step: 2 } },
   })
   assert.deepEqual(ledgerDayKeys(doc), ['2026-10-18'])
   assert.equal(doc.sessions.s1.lastSeq, 3)
   assert.equal(doc.samples.s1.step, 2)
   assert.equal({}.inputTokens, undefined)
+
+  // A slot with no readable instant is dropped rather than kept at 0: the next
+  // replacement would subtract it from the epoch-0 hour while the day bucket kept
+  // it, and the day would stop being the sum of its hours with no way back.
+  const noInstant = deserializeDocument({
+    samples: { s1: { dayKey: '2026-10-18', provider: 'p', model: 'm', usage: { inputTokens: 5, calls: 1 }, turn: 1, step: 2 } },
+  })
+  assert.deepEqual(noInstant.samples, {})
 
   // Numbers that are not numbers become 0 rather than NaN.
   const messy = deserializeDocument({ days: { '2026-10-18': { p: { m: { inputTokens: 'lots', calls: null } } } } })
@@ -313,4 +325,102 @@ test('a usage chunk inside a retained stream is read for assistant/attempt', () 
 test('isEmptySample flags a zero-token settlement', () => {
   assert.equal(isEmptySample({ usage: bucketsOf({ inputTokens: 0, outputTokens: 0 }) }), true)
   assert.equal(isEmptySample({ usage: bucketsOf({ inputTokens: 0, outputTokens: 1 }) }), false)
+})
+
+test('the day bucket always equals the sum of that day\u2019s hour buckets', () => {
+  // The invariant the two maps are held to. They are written by one
+  // `applySample`, so the only way to break it is a replacement that moves a
+  // sample between hours.
+  const doc = createDocument()
+  const morning = sample({ atMs: new Date('2026-10-18T09:15:00').getTime(), sessionId: 's1' })
+  const evening = sample({ atMs: new Date('2026-10-18T21:45:00').getTime(), sessionId: 's1', step: 2 })
+  applySample(doc, morning, undefined)
+  applySample(doc, evening, undefined)
+  // A retry of the evening call, settling in the next hour with other numbers.
+  const retried = sample({
+    atMs: new Date('2026-10-18T22:05:00').getTime(),
+    sessionId: 's1',
+    step: 2,
+    usage: { inputTokens: 40, outputTokens: 4 },
+  })
+  applySample(doc, retried, evening)
+
+  const day = doc.days['2026-10-18']['opencode-go']['deepseek-v4.1-flash']
+  const hours = hoursOfDay(doc, '2026-10-18')
+  const summed = hours.reduce((acc, row) => acc + row.buckets['opencode-go']['deepseek-v4.1-flash'].inputTokens, 0)
+  assert.equal(day.inputTokens, summed)
+  assert.equal(day.calls, hours.reduce((acc, row) => acc + row.buckets['opencode-go']['deepseek-v4.1-flash'].calls, 0))
+  // The retry moved the call rather than copying it: the hour it left is gone.
+  assert.deepEqual(hours.map((row) => row.hour), [9, 22])
+})
+
+test('hoursOfDay lists only the hours that recorded something', () => {
+  const doc = createDocument()
+  assert.equal(hasHourBuckets(doc), false)
+  applySample(doc, sample({ atMs: new Date('2026-10-18T07:00:00').getTime(), sessionId: 's1' }), undefined)
+  applySample(doc, sample({ atMs: new Date('2026-10-19T07:00:00').getTime(), sessionId: 's1', step: 2 }), undefined)
+
+  assert.equal(hasHourBuckets(doc), true)
+  assert.deepEqual(hoursOfDay(doc, '2026-10-18').map((row) => row.hour), [7])
+  // A day that recorded nothing is an empty list, never a day of zeroes: the
+  // chart has to be able to tell "no record" from "nothing spent".
+  assert.deepEqual(hoursOfDay(doc, '2026-10-17'), [])
+})
+
+test('mergeBucketMap adds rows without inventing an hour bucket', () => {
+  const source = createDocument()
+  applySample(source, sample({ atMs: new Date('2026-10-18T10:00:00').getTime(), sessionId: 's1' }), undefined)
+
+  const loaded = createDocument()
+  mergeBucketMap(loaded.days, source.days)
+  mergeBucketMap(loaded.hours, source.hours)
+  assert.equal(loaded.days['2026-10-18']['opencode-go']['deepseek-v4.1-flash'].inputTokens, 100)
+  assert.deepEqual(hoursOfDay(loaded, '2026-10-18').map((row) => row.hour), [10])
+
+  // Merging the day map alone leaves the hour map alone. That is the whole
+  // reason the load path merges them separately instead of replaying the file
+  // through the fold, which would key an hour bucket off a made-up timestamp.
+  const dayOnly = createDocument()
+  mergeBucketMap(dayOnly.days, source.days)
+  assert.equal(hasHourBuckets(dayOnly), false)
+
+  // It adds rather than replaces, which is why the target has to be the live
+  // (empty at load) document rather than a second read of the same file.
+  mergeBucketMap(loaded.days, source.days)
+  assert.equal(loaded.days['2026-10-18']['opencode-go']['deepseek-v4.1-flash'].inputTokens, 200)
+})
+
+test('applySample can fold into the hour map alone, for the one-time rebuild', () => {
+  const doc = createDocument()
+  const first = sample({ atMs: new Date('2026-10-18T10:00:00').getTime(), sessionId: 's1' })
+  assert.equal(applySample(doc, first, undefined, { days: false, hours: true, sessions: false }), true)
+
+  assert.deepEqual(hoursOfDay(doc, '2026-10-18').map((row) => row.hour), [10])
+  // Everything it was told to leave alone is still untouched.
+  assert.deepEqual(doc.days, {})
+  assert.deepEqual(doc.sessions, {})
+  assert.deepEqual(doc.samples, {})
+})
+
+test('mergeTotalsMap adds one day\'s rows into another without touching a prototype', () => {
+  // What a multi-day window needs before it can be converted to money: the
+  // `provider -> model -> totals` maps of several days summed into one.
+  const target = { 'opencode-go': { 'deepseek-flash': bucketsOf({ inputTokens: 100, outputTokens: 10 }) } }
+  mergeTotalsMap(target, {
+    'opencode-go': { 'deepseek-flash': bucketsOf({ inputTokens: 1, outputTokens: 2 }), 'gpt-5.6-luna': bucketsOf({ inputTokens: 5 }) },
+    'deepseek': { 'deepseek-flash': bucketsOf({ inputTokens: 7 }) },
+  })
+
+  assert.equal(target['opencode-go']['deepseek-flash'].inputTokens, 101)
+  assert.equal(target['opencode-go']['deepseek-flash'].outputTokens, 12)
+  assert.equal(target['opencode-go']['gpt-5.6-luna'].inputTokens, 5)
+  assert.equal(target['deepseek']['deepseek-flash'].inputTokens, 7)
+  // The guard matters here: without it this row would replace the map's
+  // prototype instead of adding a provider.
+  mergeTotalsMap(target, JSON.parse('{"__proto__": {"polluted": {"inputTokens": 1}}}'))
+  assert.equal(Object.getPrototypeOf(target), Object.prototype)
+  assert.equal(target.polluted, undefined)
+  // Nothing to merge is not an error.
+  mergeTotalsMap(target, undefined)
+  assert.equal(target['opencode-go']['deepseek-flash'].inputTokens, 101)
 })

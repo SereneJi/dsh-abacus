@@ -48,8 +48,9 @@
 
 | 路径 | 内容 |
 |---|---|
-| `$DSH_HOME/usage-stat/usage.json` | 账本：`days`（按日期/供应商/模型）、`sessions`（按会话）、`samples`（替换槽位）、`history`（补录书签） |
+| `$DSH_HOME/usage-stat/usage.json` | 账本：`days`（按日期/供应商/模型）、`hours`（按小时，键 `YYYY-MM-DDTHH`）、`sessions`（按会话）、`samples`（替换槽位）、`history`（补录书签）、`hoursBuiltAt`（小时桶的重建书签）、`replayGuardAt`（副本日志的检查书签） |
 | `$DSH_HOME/usage-stat/providers.json` | 供应商余额与套餐快照（带 `updatedAt`，重启后仍然可用） |
+| `$DSH_HOME/usage-stat/upstream.json` | 从上游抓到的价目表与节假日表，各带自己的 `fetchedAt`；抓不到就用内置表 |
 | `$DSH_HOME/usage-stat/config.json` | 插件配置 |
 
 `$DSH_HOME` 默认是 `~/.dsh`，可用环境变量覆盖。配置也可以直接改文件（改完刷新页面即可；
@@ -65,11 +66,27 @@
   "alertBalanceBelow": 0,
   "alertWindow5h": 0,
   "alertWindowWeek": 0,
-  "alertWindowMonth": 0
+  "alertWindowMonth": 0,
+  "prices": {}
 }
 ```
 
 字段含义、范围与默认值见 [README 的配置表](README.md#配置)。
+
+### 日桶与小时桶
+
+`hours` 与 `days` 是**同一次 `applySample` 写出来的两张表**，不是两遍扫描同一串事件 ——
+两遍扫就是一个账本开始自相矛盾的起点。代价是必须守住一条不变式：
+
+> **某一天的日桶 = 该天所有小时桶之和。**
+
+`test/document.test.mjs` 直接断言这条（含跨小时边界的重试：旧小时桶要被减掉）。小时键从
+`sample.atMs` 推导而不是另存字段，所以样本记录不可能报出自相矛盾的日与小时。
+
+旧文件没有 `hours` 键时读作「未按这个分辨率记录」而不是零：`UsageService` 会用
+`hoursBuiltAt === undefined` 判定，从会话日志里**重建一次**（清空后单遍折叠，不走 seq 守卫，
+因为这次扫描的目的就是重建，半满的图会把每个已有调用再算一遍）。之后的实时事件与强制补录
+都走同一次折叠，所以两边的口径永远一致。
 
 ## HTTP 接口
 
@@ -117,6 +134,36 @@ DSH 的会话日志是 `$DSH_HOME/sessions/**/session.v4.jsonl.zstd`，**多个 
 信封，交给同一套折叠逻辑。补录落盘一个书签（`doc.history`），启动时只在没有书签时才扫全量；
 扫到的每一个会话都复用 `seq` 重放保护，所以补录与实时流重叠也不会重复计数。
 
+### 回放与实时流如何不打架
+
+补录在启动时跑，而实时事件同一时刻就到了，所以两条路径必须约定清楚，否则「补录」反而会把历史吃掉：
+
+- **扫描期间落地的实时事件先排队**（`this.deferred`），扫描结束的 `finally` 里再由 `drainDeferred()` 重放。不排队的话，一条实时事件会把 `doc.sessions[id].lastSeq` 推高，随后回放读到「`seq <= lastSeq`」就把**整份日志**当成已计过而丢弃 —— 插件启动前那一段历史永远补不回来，而补录存在的唯一理由就是它。
+- **`seq` 守卫是按会话 id 的**，所以「整会话被复制成另一个会话」躲得过去。判别靠结算键：`settlementKeyOf` 用 DSH 的**消息 id**（`id:`）作键，没有 id 时退回 `时间+turn+step+供应商+模型`（`at:`）；扫描时只有 `id:` 键参与「日志彼此包含」的判定，`at:` 键只用于日志内去重。用时间戳当键会把 legitimately 相同的两次调用判成副本（实测两次同样的调用在同一毫秒结算），用 id 不会。
+- **发现副本时整份账本重建一次**，因为日桶无法事后分辨哪一半是副本；`replayGuardAt` 记住「检查过了」，之后不再重建。代价是日志已被 DSH 删掉的调用会在重建时丢。
+- **样本槽的 `atMs` 不合法就丢弃这个槽**（`deserializeDocument`）而不置 0：置 0 会让下一次替换从「纪元 0 那个小时」里减掉旧样本，而日桶仍留着它，于是「某天 = 该天各小时之和」永久破裂且无法追溯是哪一次调用。
+
+### 价目表、峰谷价与上游抓取
+
+金额是**读取时的视图**，不写进账本：`lib/core/pricing.js` 的 `costOfHourBuckets(hours, table, {atMs, holidays})`
+每次查询都按当前表重算，所以改一个价格就改掉了它生效范围内的全部历史。价目表的形状是
+`{模型: [行, ...]}`，每行带一个 `from` 生效日期（`''` = 从最早算起）——**涨价是加一行，不是改一行**，
+`priceOf(table, model, atMs)` 取 `atMs` 当时生效的那一行。用户填的行与内置行合并时按日期插入：
+同一天的用户行覆盖内置行，更晚的日期把内置序列接长。
+
+峰谷价：内置行带 `offPeak: true`，表示表里的数字是**空闲时段**价，工作日 9:00-12:00 与
+14:00-18:00 按 `PEAK_FACTOR = 2` 计；用户自己填的行没有这个标记（他填的价就是他要的价）。
+判定用**本机本地时间**——DSH 已经按本地日期归档，插件里再引入第二个时区是 bug 温床；
+节假日来自 `lib/core/holidays.js` 的表，落在高峰窗口内的假日按空闲计（因为中国法定节假日没有
+可计算的规则，只有一张每年公布的日历）。
+
+`lib/host/upstream.js` 每天抓一次 DeepSeek 官方定价页、每月抓一次节假日表（`timor.tech` 的
+公开接口），结果存 `upstream.json`。两条铁律：**解析失败一律返回 `{}`，绝不抛错**（抓取是附加
+功能，不能拖垮启动）；**`refresh()` 单飞且不覆盖已有的好数据**。解析器 `parseDeepSeekPrices`
+先按 `</t[dh]>` 切单元格、再按 `</tr>` 切行——反过来（先剥标签）会把行分隔符一起剥掉，这是写它时
+踩到的坑。内置的 `BUILTIN_PRICES` 是**空闲**价，与 `offPeak: true` 必须一致，否则高峰时段会被
+翻两倍。
+
 ## 代码结构
 
 ```
@@ -134,11 +181,14 @@ dsh-usage-stat/
 │  │  ├─ samples.js      # 会话事件 → 样本（用量、归属、坐标、重试边界）
 │  │  ├─ adapters.js     # 余额/套餐的端点表与纯解析函数（无网络）
 │  │  ├─ alerts.js       # 余量提醒的阈值判定（纯函数，无 I/O）
+│  │  ├─ pricing.js      # 价目表与金额折算（纯函数，无 I/O，钱是读时的视图）
+│  │  ├─ holidays.js     # 中国法定节假日表与判定（纯函数，无 I/O）
 │  │  ├─ providers.js    # 供应商显示名兜底表（纯装饰）
 │  │  └─ types.js        # 跨线传输的形状（JSDoc typedef）
 │  └─ host/
 │     ├─ usage-service.js  # 账本服务：订阅、折叠、视图、配置、持久化、历史回放
 │     ├─ probe-service.js  # 供应商探测：凭据 → 请求 → 快照（失败保留上一次成功值）
+│     ├─ upstream.js       # 定时抓 DeepSeek 定价页与节假日表，解析失败一律保留旧值
 │     ├─ credentials.js    # 凭据解析（记录 → 环境引用 → 无），纯字符串调 credentials 服务
 │     ├─ history.js        # 逐帧解压 DSH 的会话日志（拼接 zstd）并还原成事件
 │     ├─ version.js        # 从 package.json 读版本号，供界面显示
@@ -161,6 +211,7 @@ dsh-usage-stat/
    ├─ service.test.mjs    # 账本服务 + 路由的集成测试（真事件、真 handler、真落盘）
    ├─ probe.test.mjs      # 适配器表、凭据解析、探测服务（注入假 fetch，不碰网络）
    ├─ alerts.test.mjs     # 余量提醒阈值（0 = 关、低于才命中、读不到就不猜）
+   ├─ pricing.test.mjs    # 价目表解析与金额折算（未定价只报告、缓存写按输入价、改价改历史）
    ├─ history.test.mjs    # 多帧 zstd 的解帧、事件解析、日志发现
    ├─ client.test.mjs     # 浏览器端的接线与渲染测试（手写 DOM + hook 运行时）
    ├─ plugin.test.mjs     # lib/index.js 本身：九个路由、单次订阅、跨 fiber 挂载保护
@@ -199,6 +250,22 @@ dsh-usage-stat/
 - **红点是唯一刻意偏离 shell 配色的地方**。它用的是 shell 的静态色 token
   （`--dsw-static-red-400`，带 `currentColor` 兜底），而不是语义 token —— 一个跟随主题
   墨色的警示标记读起来不像警示。除此之外整份 CSS 只用语义 token。
+
+- **金额是读取时算出来的视图，不写进账本**。参考实现（`@linxin666/dsh-usage`）在折叠每个
+  调用时就把 cost 盖进桶里；这里刻意不这么做，因为价目表是用户可编辑的 —— 把价格折进历史
+  意味着改一次价只影响以后的调用，而用户改价十有八九是因为之前填错了。所以
+  `costOfBuckets` 每次都拿当前价目表重新算。代价是每次读 `/range` 要遍历一遍窗口内的桶，
+  但那是几万次乘法，不是 I/O。
+- **未定价的模型上报，不当 0 计**。把未知价格当成 0 会让合计看起来像免费的，比不给数字更糟。
+  所以 `costOfBuckets` 同时返回 `unpricedTokens` / `unpriced[]`，界面把它们单独说出来。
+- **缓存写缺价时按输入价计**。多数供应商就是这么计的，而留一个空的缓存写字段更可能意味着
+  「没单独定价」而不是「免费」。
+- **金额折算的范围在客户端收窄，不重新请求**。宿主发整棵树（每个供应商、每个模型、各自的
+  定价状态），`costScope` 在客户端切；否则切一次范围就要一次往返，而且总额、计费 token 数
+  与未定价提示有可能来自不同的响应而互相矛盾。
+- **客户端的价目表解析是第二份实现**（客户端不能 require 插件代码）。这是被
+  `test/client.test.mjs` 用**同一串输入同时喂给两份实现并比对结果**钉住的：一旦两边分叉，
+  测试就红。
 
 ## 开发
 

@@ -310,6 +310,15 @@ const OVERVIEW = {
     alertWindow5h: 10,
     alertWindowWeek: 5,
     alertWindowMonth: 2,
+    prices: {
+      'mimo-v2.6-flash': { input: 0.5, output: 1.5, cacheRead: 0.1, cacheWrite: 0.5 },
+    },
+  },
+  // What the editor names under the table, so the render shows both halves of
+  // the rule: the rows the user wrote, and the rows they did not have to.
+  builtinPrices: {
+    'deepseek-flash': { input: 1, output: 4, cacheRead: 0.02, cacheWrite: 0, offPeak: true },
+    'deepseek-v4-pro': { input: 4.5, output: 13.5, cacheRead: 0.15, cacheWrite: 0, offPeak: true },
   },
   current: { provider: 'opencode-go', model: 'deepseek-v4.1-flash', displayName: 'OpenCode Go' },
   providers: [
@@ -331,11 +340,57 @@ const OVERVIEW = {
   history: { atMs: FIXED_NOW - 3600_000, files: 3, events: 41 },
 }
 
+/**
+ * A cost view in the shape the host sends: one provider priced by the built-in
+ * table, one priced by a line the user added, and one the table cannot price at
+ * all. Those are the three cases the tab has to tell apart, and the third one is
+ * why the total is not simply "everything multiplied out".
+ */
+const COST = {
+  currency: 'CNY',
+  total: 46.82,
+  tokens: 33_280_000,
+  pricedTokens: 32_280_000,
+  unpricedTokens: 1_000_000,
+  unpricedCount: 1,
+  unpriced: [{ model: 'gpt-5.6-luna', tokens: 1_000_000 }],
+  providers: [
+    {
+      provider: 'opencode-go',
+      displayName: 'OpenCode Go',
+      cost: 44.9,
+      tokens: 32_100_000,
+      pricedTokens: 32_100_000,
+      unpricedTokens: 0,
+      models: [{ model: 'deepseek-v4.1-flash', cost: 44.9, tokens: 32_100_000, calls: 1_812, priced: true }],
+    },
+    {
+      provider: 'deepseek-official',
+      displayName: 'DeepSeek Account',
+      cost: 1.92,
+      tokens: 180_000,
+      pricedTokens: 180_000,
+      unpricedTokens: 0,
+      models: [{ model: 'deepseek-flash', cost: 1.92, tokens: 180_000, calls: 96, priced: true }],
+    },
+    {
+      provider: 'openrouter',
+      displayName: 'OpenRouter',
+      cost: 0,
+      tokens: 1_000_000,
+      pricedTokens: 0,
+      unpricedTokens: 1_000_000,
+      models: [{ model: 'gpt-5.6-luna', cost: 0, tokens: 1_000_000, calls: 24, priced: false }],
+    },
+  ],
+}
+
 const RANGE = {
   from: '2026-10-12',
   to: '2026-10-18',
   totals: totals({ calls: 2_318 }),
   providers: OVERVIEW.providers,
+  cost: COST,
   days: [
     day('2026-10-12', 240),
     day('2026-10-13', 388),
@@ -344,7 +399,10 @@ const RANGE = {
     day('2026-10-16', 331),
     day('2026-10-17', 469),
     day('2026-10-18', 412),
-  ],
+    // Each day carries its own money too, so the cost tab can chart the window
+    // day by day. Derived from the same call count as the tokens, so the money
+    // bars and the token bars tell the same story.
+  ].map((row) => ({ ...row, cost: { currency: 'CNY', total: Math.round(4682 * (row.totals.calls / 412)) / 100 } })),
 }
 
 const FACTS = {
@@ -598,6 +656,7 @@ async function main() {
 
   const tabs = [
     ['usage', '用量'],
+    ['cost', '金额'],
     ['account', '账户'],
     ['settings', '设置'],
   ]

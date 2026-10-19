@@ -100,6 +100,12 @@ function overviewDocument(overrides = {}) {
     current: { provider: 'opencode-go', displayName: 'OpenCode Go', model: 'deepseek-v4.1-flash', ...(overrides.current ?? {}) },
     providers: overrides.providers ?? day.providers,
     alerts: overrides.alerts ?? [],
+    // The rows a model gets when the user has not priced it. The price editor
+    // names them so a reader can see what a row is overriding.
+    builtinPrices: overrides.builtinPrices ?? {
+      'deepseek-flash': { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 2 },
+      'deepseek-v4-pro': { input: 9, output: 27, cacheRead: 0.3, cacheWrite: 9 },
+    },
     // Range aggregates are not part of the overview: the settings page asks the
     // `/range` route for whatever window the user picked.
     usage: {
@@ -121,6 +127,45 @@ function rangeDocument(overrides = {}) {
       { date: '2026-10-17', totals: day.totals },
       { date: '2026-10-18', totals: day.totals },
     ],
+  }
+}
+
+
+/**
+ * A cost view in the shape the host puts inside `/range` and each of its hours.
+ *
+ * It carries one priced provider and one unpriced model on purpose: the two
+ * cases the tab has to tell apart, because `¥0.00` and "we cannot price this"
+ * mean opposite things and only one of them belongs in the total.
+ */
+function costDocument(overrides = {}) {
+  return {
+    currency: 'CNY',
+    total: 1.5,
+    tokens: 3_000_000,
+    pricedTokens: 2_000_000,
+    unpricedTokens: 1_000_000,
+    unpricedCount: 1,
+    unpriced: [{ model: 'gpt-5.6-luna', tokens: 1_000_000 }],
+    providers: [
+      {
+        provider: 'opencode-go',
+        cost: 1.5,
+        tokens: 2_000_000,
+        pricedTokens: 2_000_000,
+        unpricedTokens: 0,
+        models: [{ model: 'deepseek-v4.1-flash', cost: 1.5, tokens: 2_000_000, calls: 12, priced: true }],
+      },
+      {
+        provider: 'deepseek',
+        cost: 0,
+        tokens: 1_000_000,
+        pricedTokens: 0,
+        unpricedTokens: 1_000_000,
+        models: [{ model: 'gpt-5.6-luna', cost: 0, tokens: 1_000_000, calls: 3, priced: false }],
+      },
+    ],
+    ...overrides,
   }
 }
 
@@ -881,8 +926,11 @@ test('the settings tab owns every knob and drops the ledger bounds', async () =>
   const text = textOf(tree)
 
   assert.match(text, /启用插件/)
-  assert.match(text, /更新间隔（秒）/)
-  assert.match(text, /查询间隔（秒）/)
+  assert.match(text, /更新间隔/)
+  assert.match(text, /查询间隔/)
+  // The unit lives in a mark after the box, not inside the label, so every
+  // numeric row lines up on one right edge.
+  assert.doesNotMatch(text, /（秒）/)
   assert.match(text, /余量提醒/)
   // Retention and the size cap are gone: both only ever threw history away.
   assert.doesNotMatch(text, /历史保留天数/)
@@ -1375,9 +1423,431 @@ test('the settings tab exposes every reminder threshold', async () => {
   assert.ok(numbers.every((input) => input.props.min === 0))
   assert.equal(findAllByPart(tree, 'alert-check').length, 1)
 
-  // Every one of the four controls carries a unit mark, so the amount box lands
-  // on the same right edge as the three percentage boxes under it instead of
-  // sitting one suffix-width further right.
-  const suffixes = findAllByPart(tree, 'alert-unit')
-  assert.deepEqual(suffixes.map((node) => textOf(node)), ['元', '%', '%', '%'])
+  // Every numeric row in the form carries a unit mark, so all six boxes end on
+  // the same right edge instead of the ones without a mark sitting a
+  // suffix-width further right.
+  const suffixes = findAllByPart(tree, 'form-unit')
+  assert.deepEqual(suffixes.map((node) => textOf(node)), ['秒', '秒', '元', '%', '%', '%'])
+})
+
+test('chartHours fills the day to twenty-four columns, gaps included', () => {
+  const page = createPage()
+  const react = createReact()
+  const module = loadBundle(page, react).factory(fakeRequire(react))
+  const { chartHours, clockLabel } = module.__internals
+
+  const hours = chartHours({
+    hours: [
+      { hour: 0, totals: { inputTokens: 5, calls: 1 } },
+      { hour: 23, totals: { inputTokens: 7, calls: 1 } },
+    ],
+  })
+  assert.equal(hours.length, 24)
+  assert.deepEqual(hours.map((row) => row.hour), Array.from({ length: 24 }, (_, hour) => hour))
+  // A quiet hour is a real column of nothing, so the chart reads as a clock
+  // rather than as a list of the hours that happened to be busy.
+  assert.equal(hours[12].totals.inputTokens, 0)
+  assert.equal(hours[23].totals.inputTokens, 7)
+  assert.equal(clockLabel(9), '09:00')
+  assert.equal(clockLabel(18), '18:00')
+  // No data at all is an empty day, not a throw.
+  assert.equal(chartHours(undefined).length, 24)
+})
+
+test('peakHourOf names the hour the hour chart scales to', () => {
+  const page = createPage()
+  const react = createReact()
+  const module = loadBundle(page, react).factory(fakeRequire(react))
+  const { chartHours, peakHourOf } = module.__internals
+
+  const hours = chartHours({
+    hours: [
+      { hour: 9, totals: { inputTokens: 10 } },
+      { hour: 15, totals: { inputTokens: 900 } },
+    ],
+  })
+  assert.deepEqual(peakHourOf(hours), { value: 900, hour: 15 })
+  // Nothing recorded: no peak, and no hour to name.
+  assert.deepEqual(peakHourOf(chartHours({ hours: [] })), { value: 0, hour: -1 })
+})
+
+test('a one-day window charts the day by the hour instead of by the day', async () => {
+  const page = createPage()
+  const react = createReact()
+  const day = dayDocument()
+  const now = new Date()
+  const pad = (value) => String(value).padStart(2, '0')
+  const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+  const { fetch } = routedFetch({
+    'api/usage-stat/range': {
+      ok: true,
+      range: {
+        from: today,
+        to: today,
+        totals: day.totals,
+        providers: day.providers,
+        days: [{ date: today, totals: day.totals }],
+        hours: {
+          date: today,
+          available: true,
+          hours: [
+            { hour: 9, totals: { inputTokens: 10, calls: 2 } },
+            { hour: 15, totals: { inputTokens: 900, calls: 5 } },
+          ],
+        },
+      },
+    },
+  })
+  const module = loadBundle(page, react, { fetch }).factory(fakeRequire(react))
+  const { UsageTab } = module.__internals
+
+  const props = { overview: overviewDocument() }
+  react.render(UsageTab, props)
+  await tick()
+  findByPart(react.render(UsageTab, props).tree, 'range-today').props.onClick()
+  // The click only records the choice. The render after it is what changes the
+  // window and starts the fetch, so the fetch needs a tick of its own before the
+  // numbers can be read — nothing stale is shown in between, by design.
+  await tick()
+  react.render(UsageTab, props)
+  await tick()
+  const { tree } = react.render(UsageTab, props)
+  const text = textOf(tree)
+
+  assert.match(text, /每小时用量/)
+  assert.doesNotMatch(text, /每日用量/)
+  // The peak is named in clock time, because that is what the bars scale to.
+  assert.match(text, /15:00/)
+  // Twenty-four columns, and only the two hours that recorded something drew a
+  // bar: a quiet hour draws nothing rather than a zero-height stub.
+  assert.equal(findAllByPart(tree, 'chart-hour').length, 24)
+  assert.equal(findAllByPart(tree, 'chart-bar').length, 2)
+  // The axis is a clock, not a date.
+  assert.match(text, /00:00/)
+  assert.match(text, /18:00/)
+  assert.doesNotMatch(text, /10-12/)
+})
+//#region -------------------------------------------------------------- cost tab
+
+test('formatMoney keeps the precision that matters at each magnitude', () => {
+  const react = createReact()
+  const module = loadBundle(createPage(), react).factory(fakeRequire(react))
+  const { formatMoney } = module.__internals
+
+  // A day can be a few yuan and a single cheap call a fraction of a cent. Two
+  // decimals everywhere would print every small amount as ¥0.00, which reads as
+  // "free" rather than "small".
+  assert.equal(formatMoney(0), '¥0.00')
+  assert.equal(formatMoney(0.00032), '¥0.00032')
+  assert.equal(formatMoney(0.0123), '¥0.012')
+  assert.equal(formatMoney(1.5), '¥1.50')
+  assert.equal(formatMoney(1234.5), '¥1,234.50')
+  // Nothing usable is nothing, not `¥NaN`.
+  assert.equal(formatMoney(undefined), '¥0.00')
+  assert.equal(formatMoney(Number.NaN), '¥0.00')
+})
+
+test('the client reads a price row exactly like the host does', async () => {
+  const react = createReact()
+  const module = loadBundle(createPage(), react).factory(fakeRequire(react))
+  const { pricesFromRows, priceRowsFrom, canonicalPrices, blankPriceRow } = module.__internals
+  const host = await import('../lib/core/pricing.js')
+
+  // The client cannot require plugin code, so filling a row is a second
+  // implementation. It is only safe as long as it is the *same* one.
+  const rows = [
+    { model: 'DeepSeek-V4.1-Flash', from: '', input: '2', output: '8', cacheRead: '', cacheWrite: '' },
+    { model: 'gpt-5.6-luna', from: '2026-10-01', input: '1.5', output: '4.5', cacheRead: '0.05', cacheWrite: '1.5' },
+    // A price change is a second row for the same model, not an edit of the first.
+    { model: 'gpt-5.6-luna', from: '2026-10-15', input: '3', output: '9', cacheRead: '0.1', cacheWrite: '3' },
+    // Nothing typed in at all is an empty slot, not a bad row.
+    blankPriceRow(),
+  ]
+
+  const mine = pricesFromRows(rows)
+  assert.deepEqual(mine.errors, [])
+  assert.deepEqual(mine.prices, host.normalizePrices(mine.prices))
+  // Two fields is a complete row: a model with no cache-write price has none.
+  assert.equal(mine.prices['deepseek-v4.1-flash'][0].cacheWrite, 0)
+  // The undated row leads, and the later price follows the earlier one.
+  assert.deepEqual(mine.prices['gpt-5.6-luna'].map((row) => row.from), ['2026-10-01', '2026-10-15'])
+  // Model names are matched case-insensitively, the way the host matches them.
+  assert.deepEqual(Object.keys(mine.prices).sort(), ['deepseek-v4.1-flash', 'gpt-5.6-luna'])
+
+  // And the round trip back into the grid keeps what the host would keep: one
+  // line per dated row, oldest first.
+  assert.deepEqual(
+    priceRowsFrom(mine.prices).map((row) => `${row.model}@${row.from}`),
+    ['deepseek-v4.1-flash@', 'gpt-5.6-luna@2026-10-01', 'gpt-5.6-luna@2026-10-15'],
+  )
+  assert.equal(canonicalPrices(mine.prices), canonicalPrices(host.normalizePrices(mine.prices)))
+})
+
+test('a row named like a prototype member is a bad row, not a replaced prototype', () => {
+  const react = createReact()
+  const module = loadBundle(createPage(), react).factory(fakeRequire(react))
+  const { pricesFromRows } = module.__internals
+
+  const parsed = pricesFromRows([
+    { model: '__proto__', input: '1', output: '2' },
+    { model: 'constructor', input: '1', output: '2' },
+    { model: 'prototype', input: '1', output: '2' },
+  ])
+  assert.deepEqual(parsed.prices, {})
+  assert.deepEqual(parsed.errors.map((entry) => entry.row), [1, 2, 3])
+  assert.equal(Object.getPrototypeOf(parsed.prices), Object.prototype)
+})
+
+test('a row that is half filled in is named, and the whole ones still save', () => {
+  const react = createReact()
+  const module = loadBundle(createPage(), react).factory(fakeRequire(react))
+  const { pricesFromRows } = module.__internals
+
+  const parsed = pricesFromRows([
+    { model: 'ark-plan', input: '1', output: '4' },
+    // A name with no price is not a price of zero.
+    { model: 'mimo-v2.6-flash', input: '', output: '' },
+    // A price with no name cannot be looked up by anything.
+    { model: '', input: '1', output: '2' },
+    // A number that is not one.
+    { model: 'gpt-5.6-luna', input: 'cheap', output: '4' },
+  ])
+
+  assert.deepEqual(Object.keys(parsed.prices), ['ark-plan'])
+  assert.deepEqual(parsed.errors.map((entry) => entry.row), [2, 3, 4])
+})
+
+test('costScope narrows to a provider and to one model of it', () => {
+  const react = createReact()
+  const module = loadBundle(createPage(), react).factory(fakeRequire(react))
+  const { costScope } = module.__internals
+  const cost = costDocument()
+
+  assert.equal(costScope(cost, '', ''), cost)
+
+  const provider = costScope(cost, 'opencode-go', '')
+  assert.equal(provider.total, 1.5)
+  assert.equal(provider.tokens, 2_000_000)
+  assert.equal(provider.pricedTokens, 2_000_000)
+  assert.equal(provider.unpricedCount, 0)
+  assert.equal(provider.providers.length, 1)
+
+  const model = costScope(cost, 'deepseek', 'gpt-5.6-luna')
+  assert.equal(model.total, 0)
+  assert.equal(model.pricedTokens, 0)
+  assert.equal(model.unpricedTokens, 1_000_000)
+  assert.equal(model.unpricedCount, 1)
+  assert.equal(model.providers[0].models.length, 1)
+
+  // An unknown provider is nothing to show, not a zero.
+  assert.equal(costScope(cost, 'nope', ''), null)
+  assert.equal(costScope(null, 'opencode-go', ''), null)
+})
+
+test('costColumns fills the clock and follows the scope', () => {
+  const react = createReact()
+  const module = loadBundle(createPage(), react).factory(fakeRequire(react))
+  const { costColumns, peakColumn } = module.__internals
+  const hourView = {
+    date: '2026-10-18',
+    available: true,
+    hours: [
+      { hour: 9, cost: costDocument({ total: 0.5 }) },
+      { hour: 15, cost: costDocument({ total: 1.0 }) },
+    ],
+  }
+
+  const all = costColumns(hourView, '', '')
+  assert.equal(all.length, 24)
+  assert.equal(all[9].value, 0.5)
+  assert.equal(all[15].value, 1)
+  // An hour with no record is a zero column, not a missing one.
+  assert.equal(all[12].value, 0)
+  assert.deepEqual(peakColumn(all), { value: 1, hour: 15, date: '' })
+
+  // Narrowed to the provider with no price, every hour is worth nothing — and
+  // the chart says so rather than naming a peak of zero.
+  const scoped = costColumns(hourView, 'deepseek', '')
+  assert.equal(scoped[9].value, 0)
+  assert.deepEqual(peakColumn(scoped), { value: 0, hour: -1, date: '' })
+})
+
+test('the cost tab converts the window and follows the scope picker', async () => {
+  const react = createReact()
+  const { fetch } = routedFetch({
+    'api/usage-stat/range': { ok: true, range: { ...rangeDocument(), cost: costDocument() } },
+  })
+  const module = loadBundle(createPage(), react, { fetch }).factory(fakeRequire(react))
+  const { CostTab } = module.__internals
+  const props = { overview: overviewDocument() }
+
+  react.render(CostTab, props)
+  await tick()
+  const whole = react.render(CostTab, props).tree
+  const text = textOf(whole)
+  assert.match(text, /金额折算/)
+  assert.match(text, /¥1\.50/)
+  assert.match(text, /gpt-5\.6-luna/)
+  // The unpriced model is named, and the number it would have contributed is
+  // called out as uncounted rather than folded in as zero.
+  assert.notEqual(findByPart(whole, 'cost-unpriced'), null)
+  assert.equal(findAllByPart(whole, 'cost-provider').length, 2)
+
+  // Two boxes, not one: the provider first, then the model within it. The model
+  // box has nothing to offer until a provider is chosen.
+  assert.equal(findByPart(whole, 'cost-scope-model').props.disabled, true)
+
+  findByPart(whole, 'cost-scope-provider').props.onChange({ target: { value: 'opencode-go' } })
+  const scoped = react.render(CostTab, props).tree
+  // The breakdown narrows to the one provider. The pickers still list every
+  // name — they have to, that is what a picker is — so the assertion is on the
+  // rows, not on the text.
+  assert.equal(findAllByPart(scoped, 'cost-provider').length, 1)
+  assert.equal(findAllByPart(scoped, 'cost-model').length, 1)
+  assert.equal(findByPart(scoped, 'cost-unpriced'), null)
+
+  // And the second box narrows further, to one model of that provider.
+  findByPart(scoped, 'cost-scope-model').props.onChange({ target: { value: 'deepseek-v4.1-flash' } })
+  const one = react.render(CostTab, props).tree
+  assert.equal(findAllByPart(one, 'cost-provider').length, 1)
+  assert.equal(findAllByPart(one, 'cost-model').length, 1)
+})
+
+test('a one-day window charts the cost by the hour', async () => {
+  const react = createReact()
+  const day = dayDocument()
+  const now = new Date()
+  const pad = (value) => String(value).padStart(2, '0')
+  const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+  const { fetch } = routedFetch({
+    'api/usage-stat/range': {
+      ok: true,
+      range: {
+        from: today,
+        to: today,
+        totals: day.totals,
+        providers: day.providers,
+        days: [{ date: today, totals: day.totals }],
+        cost: costDocument(),
+        hours: {
+          date: today,
+          available: true,
+          hours: [
+            { hour: 9, totals: { inputTokens: 10, calls: 1 }, cost: costDocument({ total: 0.25 }) },
+            { hour: 15, totals: { inputTokens: 900, calls: 4 }, cost: costDocument({ total: 2.5 }) },
+          ],
+        },
+      },
+    },
+  })
+  const module = loadBundle(createPage(), react, { fetch }).factory(fakeRequire(react))
+  const { CostTab } = module.__internals
+  const props = { overview: overviewDocument() }
+
+  react.render(CostTab, props)
+  await tick()
+  findByPart(react.render(CostTab, props).tree, 'range-today').props.onClick()
+  // Same two-step as the usage tab: the click records, the next render fetches.
+  await tick()
+  react.render(CostTab, props)
+  await tick()
+  const { tree } = react.render(CostTab, props)
+  const text = textOf(tree)
+
+  assert.match(text, /每小时金额/)
+  // The peak is named in money and on the clock, because that is what the bars
+  // scale to.
+  assert.match(text, /最高 ¥2\.50（15:00）/)
+  assert.equal(findAllByPart(tree, 'chart-hour').length, 24)
+  assert.equal(findAllByPart(tree, 'chart-bar').length, 2)
+  assert.match(text, /00:00/)
+})
+
+test('a longer window charts the cost day by day', async () => {
+  const react = createReact()
+  const now = new Date()
+  const pad = (value) => String(value).padStart(2, '0')
+  const key = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  // The tab defaults to the last seven days and computes the window itself, so
+  // the fixture's days have to fall inside that window for the money to land.
+  const today = key(now)
+  const yesterday = key(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))
+  const { fetch } = routedFetch({
+    'api/usage-stat/range': {
+      ok: true,
+      range: {
+        ...rangeDocument(),
+        cost: costDocument(),
+        // Two of the seven days carry money; the quiet ones still get a column
+        // but draw no bar, so the window reads as seven days rather than two.
+        days: [
+          { date: yesterday, totals: { inputTokens: 10, calls: 1 }, cost: costDocument({ total: 0.4 }) },
+          { date: today, totals: { inputTokens: 20, calls: 1 }, cost: costDocument({ total: 1.2 }) },
+        ],
+      },
+    },
+  })
+  const module = loadBundle(createPage(), react, { fetch }).factory(fakeRequire(react))
+  const { CostTab } = module.__internals
+  const props = { overview: overviewDocument() }
+
+  react.render(CostTab, props)
+  await tick()
+  const { tree } = react.render(CostTab, props)
+  const text = textOf(tree)
+
+  // A multi-day window is charted by the day, the way the usage tab charts it;
+  // the clock chart is for a single day.
+  assert.match(text, /每日金额/)
+  assert.doesNotMatch(text, /每小时金额/)
+  assert.equal(findAllByPart(tree, 'chart-col').length, 7)
+  assert.equal(findAllByPart(tree, 'chart-hour').length, 0)
+  assert.equal(findAllByPart(tree, 'chart-bar').length, 2)
+  // The peak is named in money and on the day it happened.
+  const short = `${Number(today.slice(5, 7))}-${Number(today.slice(8, 10))}`
+  assert.match(text, new RegExp(`最高 ¥1\\.20（${short}）`))
+})
+
+test('the settings tab edits the price table a row at a time', async () => {
+  const react = createReact()
+  const module = loadBundle(createPage(), react).factory(fakeRequire(react))
+  const { SettingsTab } = module.__internals
+  const overview = overviewDocument({
+    config: { prices: { 'deepseek-flash': { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 2 } } },
+  })
+  const props = { overview, onConfigSaved: () => {} }
+
+  react.render(SettingsTab, props)
+  const tree = react.render(SettingsTab, props).tree
+  // One row per stored price, and each column is its own box.
+  assert.equal(findAllByPart(tree, 'price-row').length, 1)
+  assert.equal(findByPart(tree, 'price-model').props.value, 'deepseek-flash')
+  assert.deepEqual(
+    findAllByPart(tree, 'price-field').map((node) => node.props.value),
+    ['2', '8', '0.04', '2'],
+  )
+  // The built-in rows are named, so a reader can see what a row overrides.
+  assert.match(textOf(tree), /deepseek-v4-pro/)
+  // Nothing typed yet, so there is nothing to save.
+  assert.equal(findByPart(tree, 'config-save').props.disabled, true)
+
+  // A row that cannot be read blocks the save rather than being dropped.
+  findByPart(tree, 'price-field').props.onChange({ target: { value: '' } })
+  const broken = react.render(SettingsTab, props).tree
+  assert.notEqual(findByPart(broken, 'prices-bad'), null)
+  assert.equal(findByPart(broken, 'config-save').props.disabled, true)
+
+  findAllByPart(broken, 'price-field')[0].props.onChange({ target: { value: '3' } })
+  const fixed = react.render(SettingsTab, props).tree
+  assert.equal(findByPart(fixed, 'prices-bad'), null)
+  assert.equal(findByPart(fixed, 'config-save').props.disabled, false)
+
+  // A new row starts empty, and removing one takes it away again.
+  findByPart(fixed, 'price-add').props.onClick()
+  const added = react.render(SettingsTab, props).tree
+  assert.equal(findAllByPart(added, 'price-row').length, 2)
+  assert.equal(findAllByPart(added, 'price-field').length, 8)
+  findAllByPart(added, 'price-remove')[1].props.onClick()
+  const removed = react.render(SettingsTab, props).tree
+  assert.equal(findAllByPart(removed, 'price-row').length, 1)
 })
