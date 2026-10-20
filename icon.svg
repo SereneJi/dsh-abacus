@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#4d6bfe" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <title>dsh-abacus — token ledger</title>
+  <rect x="3.5" y="4.5" width="17" height="15" rx="2.4" />
+  <path d="M8 4.5v15M12 4.5v15M16 4.5v15" stroke-width="1.2" opacity="0.55" />
+  <path d="M3.5 12h17" stroke-width="1.2" opacity="0.55" />
+  <ellipse cx="8" cy="8.2" rx="1.5" ry="1.1" fill="#4d6bfe" fill-opacity="0.16" />
+  <ellipse cx="12" cy="8.2" rx="1.5" ry="1.1" fill="#4d6bfe" fill-opacity="0.16" />
+  <ellipse cx="16" cy="15.8" rx="1.5" ry="1.1" fill="#4d6bfe" fill-opacity="0.16" />
+</svg>

@@ -1,0 +1,64 @@
+{
+  "name": "dsh-abacus",
+  "version": "2.0.0",
+  "description": "dsh-abacus（算盘）：给 dsh Web GUI 用的用量台账插件，宿主端把每一次模型调用的 token 用量折进按「本地日期 / 供应商 / 模型」分桶的账本，浏览器端显示在侧边栏左下角的用量卡、输入框下方的「本次对话」明细，以及设置里的「用量统计」页（用量概览、时间范围、供应商与模型、每日用量柱状图、账户余额与套餐、余量提醒、历史补录）。",
+  "icon": "icon.svg",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "abacus",
+    "token-ledger",
+    "usage-statistics",
+    "tokens"
+  ],
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "tools",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "README.en.md",
+    "DEVELOPMENT.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.2",
+    "react": "^18.2.0"
+  },
+  "scripts": {
+    "test": "node --test --test-isolation=none test/document.test.mjs test/service.test.mjs test/probe.test.mjs test/alerts.test.mjs test/history.test.mjs test/pricing.test.mjs test/upstream.test.mjs test/client.test.mjs test/plugin.test.mjs test/tools.test.mjs",
+    "check-tokens": "node tools/check-tokens.mjs",
+    "verify-served": "node tools/verify-served.mjs",
+    "preview": "node tools/preview.mjs",
+    "rollback": "node tools/rollback.mjs",
+    "bump": "node tools/bump.mjs"
+  }
+}

@@ -1,0 +1,19 @@
+# The plugin is a pure-source package with no build step, so CI is just the
+# test suite. The two scripts that need a *running* DSH (`check-tokens`,
+# `verify-served`) are deliberately absent: they audit the installed shell, not
+# this repository, and a runner has no shell to audit.
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
